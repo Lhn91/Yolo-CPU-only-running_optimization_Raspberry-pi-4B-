@@ -1,0 +1,218 @@
+cmake_minimum_required(VERSION 3.16)
+project(yolo_inference VERSION 1.0.0 LANGUAGES C CXX)
+
+# ============================================================================
+# Build Configuration for Raspberry Pi 5 (Cortex-A76)
+# ============================================================================
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Optimization flags for Raspberry Pi 4 (Cortex-A72)
+# Pi 4 doesn't support ARMv8.2-specific features your A76 build assumes (e.g. dotprod/fp16).
+set(CORTEX_A72_FLAGS "-mcpu=cortex-a72 -mtune=cortex-a72")
+
+# Comprehensive warning flags (excluding overly pedantic type conversion warnings)
+set(WARNING_FLAGS "-Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wformat=2 -Wno-unused-parameter")
+
+# Release build flags
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${CORTEX_A72_FLAGS} ${WARNING_FLAGS} -O3 -ffast-math -flto -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${CORTEX_A72_FLAGS} ${WARNING_FLAGS} -O3 -ffast-math -flto -DNDEBUG -fno-rtti -fno-exceptions")
+
+# Debug flags
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} ${CORTEX_A72_FLAGS} -O0 -g -DDEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${CORTEX_A72_FLAGS} -O0 -g -DDEBUG")
+
+# Default to Release build
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "CXX flags: ${CMAKE_CXX_FLAGS_RELEASE}")
+
+# ============================================================================
+# Find Dependencies
+# ============================================================================
+
+# NCNN (with Vulkan support)
+if(NCNN_DIR)
+    find_package(ncnn REQUIRED PATHS ${NCNN_DIR})
+else()
+    # Try system-wide installation
+    find_package(ncnn REQUIRED)
+endif()
+
+if(ncnn_FOUND)
+    message(STATUS "NCNN found: ${ncnn_DIR}")
+else()
+    message(FATAL_ERROR "NCNN not found. Please set -DNCNN_DIR=/path/to/ncnn/lib/cmake/ncnn")
+endif()
+
+# Vulkan (for GPU acceleration on RPi5 VideoCore VII)
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+    message(STATUS "Vulkan found: ${Vulkan_LIBRARIES}")
+    add_definitions(-DNCNN_VULKAN=1)
+    set(NCNN_HAS_VULKAN ON)
+else()
+    message(STATUS "Vulkan not found, GPU acceleration disabled")
+    add_definitions(-DNCNN_VULKAN=0)
+    set(NCNN_HAS_VULKAN OFF)
+endif()
+
+# OpenCV (for video file reading)
+# Try find_package first, fallback to manual configuration
+find_package(OpenCV QUIET COMPONENTS core imgproc videoio highgui)
+if(OpenCV_FOUND)
+    message(STATUS "OpenCV found via CMake: ${OpenCV_VERSION}")
+    message(STATUS "OpenCV libs: ${OpenCV_LIBS}")
+else()
+    # Manual OpenCV configuration for Debian/Raspbian
+    message(STATUS "OpenCV CMake config not found, using manual configuration")
+    
+    # Find headers
+    find_path(OpenCV_INCLUDE_DIRS opencv4/opencv2/opencv.hpp
+        PATHS /usr/include /usr/local/include
+    )
+    if(OpenCV_INCLUDE_DIRS)
+        set(OpenCV_INCLUDE_DIRS "${OpenCV_INCLUDE_DIRS}/opencv4")
+    else()
+        find_path(OpenCV_INCLUDE_DIRS opencv2/opencv.hpp
+            PATHS /usr/include /usr/local/include
+        )
+    endif()
+    
+    if(NOT OpenCV_INCLUDE_DIRS)
+        message(FATAL_ERROR "OpenCV headers not found")
+    endif()
+    
+    # Find libraries
+    find_library(OpenCV_CORE_LIB opencv_core PATHS /usr/lib/aarch64-linux-gnu /usr/lib)
+    find_library(OpenCV_IMGPROC_LIB opencv_imgproc PATHS /usr/lib/aarch64-linux-gnu /usr/lib)
+    find_library(OpenCV_VIDEOIO_LIB opencv_videoio PATHS /usr/lib/aarch64-linux-gnu /usr/lib)
+    find_library(OpenCV_HIGHGUI_LIB opencv_highgui PATHS /usr/lib/aarch64-linux-gnu /usr/lib)
+    
+    if(NOT OpenCV_CORE_LIB OR NOT OpenCV_IMGPROC_LIB OR NOT OpenCV_VIDEOIO_LIB)
+        message(FATAL_ERROR "OpenCV libraries not found. Install: libopencv-core-dev libopencv-imgproc-dev libopencv-videoio-dev")
+    endif()
+    
+    set(OpenCV_LIBS ${OpenCV_CORE_LIB} ${OpenCV_IMGPROC_LIB} ${OpenCV_VIDEOIO_LIB})
+    
+    # Add highgui if available (for display feature)
+    # Try standard name first, then versioned name
+    find_library(OpenCV_HIGHGUI_LIB 
+        NAMES opencv_highgui opencv_highgui.so.406
+        PATHS /usr/lib/aarch64-linux-gnu /usr/lib
+        NO_DEFAULT_PATH
+    )
+    if(NOT OpenCV_HIGHGUI_LIB)
+        # Direct path fallback
+        if(EXISTS "/usr/lib/aarch64-linux-gnu/libopencv_highgui.so.406")
+            set(OpenCV_HIGHGUI_LIB "/usr/lib/aarch64-linux-gnu/libopencv_highgui.so.406")
+        endif()
+    endif()
+    
+    if(OpenCV_HIGHGUI_LIB)
+        list(APPEND OpenCV_LIBS ${OpenCV_HIGHGUI_LIB})
+        message(STATUS "OpenCV highgui: ${OpenCV_HIGHGUI_LIB}")
+    else()
+        message(STATUS "OpenCV highgui not found, display feature may not work")
+    endif()
+    
+    message(STATUS "OpenCV include: ${OpenCV_INCLUDE_DIRS}")
+    message(STATUS "OpenCV libs: ${OpenCV_LIBS}")
+endif()
+
+# Threads
+find_package(Threads REQUIRED)
+
+# ============================================================================
+# Source Files
+# ============================================================================
+
+set(SOURCES
+    src/main.cpp
+    src/neon_preprocess.cpp
+    src/input_pipeline.cpp
+    src/inference_engine.cpp
+    src/postprocess.cpp
+    src/benchmark.cpp
+)
+
+# Assembly sources (compiled separately to avoid LTO issues)
+set(ASM_SOURCES
+    src/asm_kernels.S
+)
+
+# Enable ASM for assembly compilation
+enable_language(ASM)
+
+# Set properties for ASM files
+set_source_files_properties(${ASM_SOURCES} PROPERTIES
+    LANGUAGE ASM
+    COMPILE_FLAGS "-x assembler-with-cpp"
+)
+
+set(HEADERS
+    include/common.h
+    include/neon_preprocess.h
+    include/input_pipeline.h
+    include/inference_engine.h
+    include/postprocess.h
+    include/benchmark.h
+    include/asm_kernels.h
+)
+
+# ============================================================================
+# Build Executable
+# ============================================================================
+
+add_executable(yolo_inference ${SOURCES} ${ASM_SOURCES} ${HEADERS})
+
+target_include_directories(yolo_inference PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(yolo_inference PRIVATE
+    ncnn
+    ${OpenCV_LIBS}
+    Threads::Threads
+)
+
+# Link Vulkan if available
+if(Vulkan_FOUND AND NCNN_HAS_VULKAN)
+    target_link_libraries(yolo_inference PRIVATE ${Vulkan_LIBRARIES})
+endif()
+
+# Enable Link-Time Optimization
+set_property(TARGET yolo_inference PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+# ============================================================================
+# Install
+# ============================================================================
+
+install(TARGETS yolo_inference
+    RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/models/
+    DESTINATION share/yolo_inference/models
+    FILES_MATCHING PATTERN "*.param" PATTERN "*.bin"
+)
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+message(STATUS "")
+message(STATUS "YOLOv8n Inference System Configuration:")
+message(STATUS "  Build type:      ${CMAKE_BUILD_TYPE}")
+message(STATUS "  NCNN:            ${ncnn_DIR}")
+message(STATUS "  NCNN Vulkan:     ${NCNN_HAS_VULKAN}")
+message(STATUS "  OpenCV:          ${OpenCV_VERSION}")
+message(STATUS "  Vulkan:          ${Vulkan_FOUND}")
+message(STATUS "  Install prefix:  ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "")

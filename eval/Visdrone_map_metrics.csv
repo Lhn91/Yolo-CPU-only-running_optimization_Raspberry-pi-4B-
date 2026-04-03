@@ -1,0 +1,11 @@
+metric,value
+mAP_50_95,0.034615
+mAP_50,0.085371
+mAP_75,0.019401
+AP_small,0.025208
+AP_medium,0.327865
+AP_large,0.726733
+AR_max100,0.039705
+precision_mean,0.204769
+recall_mean,0.213703
+f1_mean,0.209140

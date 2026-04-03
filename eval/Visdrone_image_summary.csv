@@ -1,0 +1,13 @@
+metric,value
+model,721_M4_BaoLong.ncnn
+mode,image
+source,/home/lhn/Visdrone/test/images
+samples,1267
+total_time_s,205.8280
+fps_overall,6.1556
+time_ms_mean,162.4530
+time_ms_std,3.2265
+fps_mean,6.1580
+fps_min,5.2680
+fps_max,6.3704
+detections_mean,2.9298
