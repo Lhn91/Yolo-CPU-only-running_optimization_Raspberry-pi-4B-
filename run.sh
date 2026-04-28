@@ -66,6 +66,8 @@ ENABLE_CLASS_FILTER=false
 ENABLE_INT8=false
 ENABLE_FP16=false
 ENABLE_VULKAN=false
+ENABLE_SERVO=false
+ENABLE_DASHBOARD=false
 VIDEO_OUTPUT=""
 CLASS_FILTER=""
 CAMERA_DEVICE="/dev/video0"
@@ -95,6 +97,8 @@ while [[ $# -gt 0 ]]; do
             echo "Display options:"
             echo "  display                            # OpenCV display (X11)"
             echo "  fb                                 # Framebuffer display (no X11, faster!)"
+            echo "  dashboard                          # Gửi dữ liệu lên Web Dashboard"
+            echo "  (kèm cam+dashboard)                # Tự bật MJPEG :8080 + đăng ký URL giống Coral"
             echo ""
             echo "Examples:"
             echo "  ./run.sh cam display class person  # Webcam + display + filter"
@@ -130,6 +134,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         fb)
             ENABLE_FB=true
+            shift
+            ;;
+        servo)
+            ENABLE_SERVO=true
+            shift
+            ;;
+        dashboard)
+            ENABLE_DASHBOARD=true
             shift
             ;;
         video)
@@ -175,6 +187,29 @@ if [ -n "$MODEL_NAME" ]; then
     BIN_INT8="${SCRIPT_DIR}/models/${MODEL_NAME}.int8.bin"
     PARAM_FP16="${SCRIPT_DIR}/models/${MODEL_NAME}.fp16.param"
     BIN_FP16="${SCRIPT_DIR}/models/${MODEL_NAME}.fp16.bin"
+
+    # Support automatically finding model inside subfolder or .ncnn extension
+    if [ -f "${SCRIPT_DIR}/models/${MODEL_NAME}.ncnn.param" ]; then
+        PARAM="${SCRIPT_DIR}/models/${MODEL_NAME}.ncnn.param"
+        BIN="${SCRIPT_DIR}/models/${MODEL_NAME}.ncnn.bin"
+    elif [ -d "${SCRIPT_DIR}/models/${MODEL_NAME}" ]; then
+        if [ -f "${SCRIPT_DIR}/models/${MODEL_NAME}/model.ncnn.param" ]; then
+            PARAM="${SCRIPT_DIR}/models/${MODEL_NAME}/model.ncnn.param"
+            BIN="${SCRIPT_DIR}/models/${MODEL_NAME}/model.ncnn.bin"
+        elif [ -f "${SCRIPT_DIR}/models/${MODEL_NAME}/model.param" ]; then
+            PARAM="${SCRIPT_DIR}/models/${MODEL_NAME}/model.param"
+            BIN="${SCRIPT_DIR}/models/${MODEL_NAME}/model.bin"
+        fi
+        PARAM_INT8="${SCRIPT_DIR}/models/${MODEL_NAME}/model.int8.param"
+        BIN_INT8="${SCRIPT_DIR}/models/${MODEL_NAME}/model.int8.bin"
+        PARAM_FP16="${SCRIPT_DIR}/models/${MODEL_NAME}/model.fp16.param"
+        BIN_FP16="${SCRIPT_DIR}/models/${MODEL_NAME}/model.fp16.bin"
+    fi
+    
+    # Neu la int8 thi bat luon co int8 de chay cho dung file
+    if [ "$ENABLE_INT8" = false ] && [ -n "$(echo "$MODEL_NAME" | grep -i 'int8')" ]; then
+        ENABLE_INT8=true
+    fi
 fi
 
 # Select model based on precision flags
@@ -182,6 +217,9 @@ if [ "$ENABLE_INT8" = true ]; then
     if [ -f "${PARAM_INT8}" ] && [ -f "${BIN_INT8}" ]; then
         PARAM="${PARAM_INT8}"
         BIN="${BIN_INT8}"
+    elif [ -n "$(echo "$MODEL_NAME" | grep -i 'int8')" ] && [ -f "${PARAM}" ] && [ -f "${BIN}" ]; then
+        # Náº¿u thÆ° má»¥c cĂ³ chá»¯ int8 vĂ  file param Ä‘Ă£ tĂ¬m tháº¥y, dĂ¹ng luĂ´n file param Ä‘Ă³
+        :
     else
         echo "Warning: INT8 model not found, falling back to FP32"
         ENABLE_INT8=false
@@ -250,6 +288,29 @@ if [ "$ENABLE_FB" = true ]; then
     # Check framebuffer access
     if [ ! -w /dev/fb0 ]; then
         echo "Note: Need framebuffer access. Run: sudo chmod 666 /dev/fb0"
+    fi
+fi
+
+# Servo motor control (requires PWM on GPIO 12)
+if [ "$ENABLE_SERVO" = true ]; then
+    ARGS+=("--servo")
+    MODE_DESC="${MODE_DESC}+Servo"
+fi
+
+# Dashboard integration
+if [ "$ENABLE_DASHBOARD" = true ]; then
+    ARGS+=("--dashboard" "http://127.0.0.1:8000")
+    MODE_DESC="${MODE_DESC}+Dashboard"
+    # MJPEG tích hợp trong yolo_inference (cùng khung hình + bbox, giống Coral :8080/stream).
+    # Tắt: MJPEG_PORT=0  |  Đổi cổng: export MJPEG_PORT=9090
+    if [ "$ENABLE_CAM" = true ] && [ "${MJPEG_PORT:-8080}" != "0" ]; then
+        ARGS+=("--mjpeg-port" "${MJPEG_PORT:-8080}")
+        MODE_DESC="${MODE_DESC}+MJPEG:${MJPEG_PORT:-8080}"
+    fi
+    # Ghi đè URL đăng ký (ít khi cần — mặc định binary tự chọn IP Tailscale hoặc LAN)
+    if [ -n "${DASHBOARD_STREAM_URL:-}" ]; then
+        ARGS+=("--dashboard-stream-url" "$DASHBOARD_STREAM_URL")
+        MODE_DESC="${MODE_DESC}+StreamURL"
     fi
 fi
 

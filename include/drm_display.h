@@ -21,6 +21,7 @@
 #include <cstring>
 #include <atomic>
 #include <algorithm>
+#include <functional>
 #include <vector>
 
 #include <fcntl.h>
@@ -191,7 +192,10 @@ public:
     };
 
     FramebufferDisplay() : fd_(-1), fb_ptr_(nullptr), fb_size_(0),
-                           running_(false), frames_displayed_(0) {}
+                           running_(false), frames_displayed_(0),
+                           bbox_enabled_(true),
+                           servo_enabled_(false), servo_direction_(0),
+                           servo_angle_(90.0f) {}
     ~FramebufferDisplay() { stop(); }
 
     // -------------------------------------------------------------------------
@@ -245,7 +249,8 @@ public:
 
     // -------------------------------------------------------------------------
     bool push_bgr(const uint8_t* bgr_data, int width, int height, int stride,
-                  const DetectionResult& result, float fps = 0, float infer_ms = 0) {
+                  const DetectionResult& result, float fps = 0, float infer_ms = 0,
+                  int cursor_x = -1, int cursor_y = -1) {
         if (!running_ || !fb_ptr_) return false;
 
         // 1. Blit scaled frame
@@ -254,8 +259,8 @@ public:
         else
             blit_scaled_rgb565(bgr_data, width, height, stride);
 
-        // 2. Bounding boxes + labels
-        if (config_.draw_bbox) {
+        // 2. Bounding boxes + labels (controlled by toggle)
+        if (bbox_enabled_.load(std::memory_order_relaxed)) {
             for (int i = 0; i < result.count; i++) {
                 draw_detection(result.detections[i]);
             }
@@ -266,12 +271,86 @@ public:
             draw_fps_indicator(fps, infer_ms);
         }
 
+        // 4. Toggle button (bottom-right)
+        draw_bbox_toggle_button();
+
+        // 5. Servo buttons (bottom-left, only if enabled)
+        if (servo_enabled_) {
+            draw_servo_buttons();
+        }
+
+        // 6. Mouse cursor (if present)
+        if (cursor_x >= 0 && cursor_y >= 0) {
+            draw_cursor(cursor_x, cursor_y);
+        }
+
         frames_displayed_++;
         return true;
     }
 
+    // -------------------------------------------------------------------------
+    // Input handler — called from TouchInput thread on press AND release
+    // -------------------------------------------------------------------------
+    void handle_input(int x, int y, bool pressed) {
+        if (pressed) {
+            // ── PRESS ──
+            // Check servo buttons (momentary: active while held)
+            if (servo_enabled_) {
+                int sx1, sy1, sx2, sy2;
+                get_servo_ccw_rect(sx1, sy1, sx2, sy2);
+                if (x >= sx1 && x <= sx2 && y >= sy1 && y <= sy2) {
+                    servo_direction_.store(-1, std::memory_order_relaxed);
+                    if (servo_callback_) servo_callback_(-1);
+                    return;
+                }
+                get_servo_cw_rect(sx1, sy1, sx2, sy2);
+                if (x >= sx1 && x <= sx2 && y >= sy1 && y <= sy2) {
+                    servo_direction_.store(+1, std::memory_order_relaxed);
+                    if (servo_callback_) servo_callback_(+1);
+                    return;
+                }
+            }
+        } else {
+            // ── RELEASE ──
+            // Stop servo on ANY release (even if finger dragged off button)
+            if (servo_enabled_ && servo_direction_.load(std::memory_order_relaxed) != 0) {
+                servo_direction_.store(0, std::memory_order_relaxed);
+                if (servo_callback_) servo_callback_(0);
+            }
+
+            // Check BBOX toggle (only activates on release)
+            int bx1, by1, bx2, by2;
+            get_bbox_button_rect(bx1, by1, bx2, by2);
+            if (x >= bx1 && x <= bx2 && y >= by1 && y <= by2) {
+                bool cur = bbox_enabled_.load(std::memory_order_relaxed);
+                bbox_enabled_.store(!cur, std::memory_order_relaxed);
+                printf("BBOX display: %s\n", !cur ? "ON" : "OFF");
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Servo configuration
+    // -------------------------------------------------------------------------
+    using ServoCallback = std::function<void(int direction)>;
+
+    void set_servo_enabled(bool en)         { servo_enabled_ = en; }
+    void set_servo_callback(ServoCallback c){ servo_callback_ = std::move(c); }
+    void update_servo_angle(float angle)    { servo_angle_ = angle; }
+    /// -1 / 0 / +1 while user holds on-screen servo buttons (for merging with remote /servo)
+    int servo_touch_direction() const {
+        return servo_direction_.load(std::memory_order_relaxed);
+    }
+
+    // -------------------------------------------------------------------------
+    // Public accessors
+    // -------------------------------------------------------------------------
     int  frames_displayed() const { return frames_displayed_.load(); }
     bool is_running()       const { return running_.load(); }
+    int  screen_width()     const { return screen_width_; }
+    int  screen_height()    const { return screen_height_; }
+    bool is_bbox_enabled()  const { return bbox_enabled_.load(std::memory_order_relaxed); }
+    void set_bbox_enabled(bool v) { bbox_enabled_.store(v, std::memory_order_relaxed); }
 
 private:
     // =========================================================================
@@ -437,6 +516,167 @@ private:
     }
 
     // =========================================================================
+    // BBOX Toggle Button (bottom-right corner)
+    // =========================================================================
+
+    /// Compute the button rectangle in screen coordinates
+    void get_bbox_button_rect(int& x1, int& y1, int& x2, int& y2) const {
+        // Adaptive font scale: smaller font for small displays
+        int btn_scale = (display_width_ > 640) ? 2 : 1;
+        int char_w    = 8 * btn_scale;
+        int char_h    = 8 * btn_scale;
+        int pad       = 4 * btn_scale;
+        int margin    = 8;
+
+        // "BBOX:ON" = 7 chars, "BBOX:OFF" = 8 chars → use 8 for sizing
+        int text_w = 8 * char_w;
+        int btn_w  = text_w + pad * 2;
+        int btn_h  = char_h + pad * 2;
+
+        x1 = display_width_  - btn_w - margin;
+        y1 = display_height_ - btn_h - margin;
+        x2 = display_width_  - margin;
+        y2 = display_height_ - margin;
+    }
+
+    void draw_bbox_toggle_button() {
+        int bx1, by1, bx2, by2;
+        get_bbox_button_rect(bx1, by1, bx2, by2);
+
+        bool on = bbox_enabled_.load(std::memory_order_relaxed);
+
+        // Button background colour
+        uint8_t bg_r, bg_g, bg_b;
+        if (on) {
+            bg_r = 0; bg_g = 160; bg_b = 0;   // green = ON
+        } else {
+            bg_r = 160; bg_g = 0; bg_b = 0;    // red   = OFF
+        }
+
+        // Background fill
+        fill_rect(bx1, by1, bx2, by2, bg_r, bg_g, bg_b);
+
+        // White border (1px)
+        draw_rect(bx1, by1, bx2, by2, 255, 255, 255, 1);
+
+        // Label text
+        const char* label = on ? "BBOX:ON" : "BBOX:OFF";
+        int btn_scale = (display_width_ > 640) ? 2 : 1;
+        int pad = 4 * btn_scale;
+        draw_text(bx1 + pad, by1 + pad, label, 255, 255, 255, btn_scale);
+    }
+
+    // =========================================================================
+    // Mouse Cursor (crosshair style)
+    // =========================================================================
+
+    void draw_cursor(int cx, int cy) {
+        int size = (display_width_ > 640) ? 10 : 6;
+
+        // Horizontal line (black outline + white center)
+        for (int dx = -size; dx <= size; dx++) {
+            put_pixel(cx + dx, cy - 1, 0, 0, 0);
+            put_pixel(cx + dx, cy,     255, 255, 255);
+            put_pixel(cx + dx, cy + 1, 0, 0, 0);
+        }
+        // Vertical line (black outline + white center)
+        for (int dy = -size; dy <= size; dy++) {
+            put_pixel(cx - 1, cy + dy, 0, 0, 0);
+            put_pixel(cx,     cy + dy, 255, 255, 255);
+            put_pixel(cx + 1, cy + dy, 0, 0, 0);
+        }
+        // Center dot (bright red)
+        put_pixel(cx, cy, 255, 50, 50);
+    }
+
+    // =========================================================================
+    // Servo Buttons  (bottom-left:  [<]  090  [>] )
+    // =========================================================================
+
+    int servo_btn_scale() const { return (display_width_ > 640) ? 2 : 1; }
+
+    void get_servo_ccw_rect(int& x1, int& y1, int& x2, int& y2) const {
+        int s   = servo_btn_scale();
+        int cw  = 8 * s;       // char width
+        int ch  = 8 * s;       // char height
+        int pad = 4 * s;
+        int margin = 8;
+        // 3 chars: "<" (but padded to look button-like)
+        int btn_w = 3 * cw + pad * 2;
+        int btn_h = ch + pad * 2;
+        x1 = margin;
+        y1 = display_height_ - btn_h - margin;
+        x2 = x1 + btn_w;
+        y2 = y1 + btn_h;
+    }
+
+    void get_servo_cw_rect(int& x1, int& y1, int& x2, int& y2) const {
+        int s   = servo_btn_scale();
+        int cw  = 8 * s;
+        int ch  = 8 * s;
+        int pad = 4 * s;
+        int gap = 4 * s;
+
+        // Position after CCW button + angle text
+        int ccw_x1, ccw_y1, ccw_x2, ccw_y2;
+        get_servo_ccw_rect(ccw_x1, ccw_y1, ccw_x2, ccw_y2);
+
+        // Angle text width: 3 digits (e.g. "090") = 3 chars
+        int angle_w = 3 * cw;
+
+        int btn_w = 3 * cw + pad * 2;
+        int btn_h = ch + pad * 2;
+
+        x1 = ccw_x2 + gap + angle_w + gap;
+        y1 = ccw_y1;
+        x2 = x1 + btn_w;
+        y2 = y1 + btn_h;
+    }
+
+    void draw_servo_buttons() {
+        int s   = servo_btn_scale();
+        int pad = 4 * s;
+        int gap = 4 * s;
+        int dir = servo_direction_.load(std::memory_order_relaxed);
+
+        // ── CCW button ──
+        {
+            int x1, y1, x2, y2;
+            get_servo_ccw_rect(x1, y1, x2, y2);
+            uint8_t bg_r = 80, bg_g = 80, bg_b = 80;  // idle: gray
+            if (dir == -1) { bg_r = 0; bg_g = 180; bg_b = 0; }  // active: green
+            fill_rect(x1, y1, x2, y2, bg_r, bg_g, bg_b);
+            draw_rect(x1, y1, x2, y2, 255, 255, 255, 1);
+            draw_text(x1 + pad, y1 + pad, " < ", 255, 255, 255, s);
+        }
+
+        // ── Angle display (between buttons) ──
+        {
+            int ccw_x1, ccw_y1, ccw_x2, ccw_y2;
+            get_servo_ccw_rect(ccw_x1, ccw_y1, ccw_x2, ccw_y2);
+
+            int angle_x = ccw_x2 + gap;
+            int angle_y = ccw_y1 + pad;
+
+            char angle_str[8];
+            int angle_int = static_cast<int>(servo_angle_ + 0.5f);
+            snprintf(angle_str, sizeof(angle_str), "%03d", std::clamp(angle_int, 0, 180));
+            draw_text(angle_x, angle_y, angle_str, 255, 255, 0, s);  // yellow
+        }
+
+        // ── CW button ──
+        {
+            int x1, y1, x2, y2;
+            get_servo_cw_rect(x1, y1, x2, y2);
+            uint8_t bg_r = 80, bg_g = 80, bg_b = 80;
+            if (dir == +1) { bg_r = 0; bg_g = 180; bg_b = 0; }
+            fill_rect(x1, y1, x2, y2, bg_r, bg_g, bg_b);
+            draw_rect(x1, y1, x2, y2, 255, 255, 255, 1);
+            draw_text(x1 + pad, y1 + pad, " > ", 255, 255, 255, s);
+        }
+    }
+
+    // =========================================================================
     // Scaled blit helpers
     // =========================================================================
 
@@ -500,6 +740,13 @@ private:
     int      offset_x_, offset_y_;
     std::atomic<bool> running_;
     std::atomic<int>  frames_displayed_;
+    std::atomic<bool> bbox_enabled_;          // toggle via touch/click
+
+    // Servo state
+    bool              servo_enabled_;
+    std::atomic<int>  servo_direction_;       // -1, 0, +1
+    float             servo_angle_;           // current angle for display
+    ServoCallback     servo_callback_;
 };
 
 }  // namespace yolo

@@ -25,9 +25,6 @@ namespace yolo {
 
 constexpr int INPUT_WIDTH = 640;
 constexpr int INPUT_HEIGHT = 480;
-constexpr int MODEL_SIZE = 416;  // Kích thước xuất NCNN (phải đúng 416)
-constexpr int NUM_CLASSES = 1;   // Custom Model (1 class: người)
-constexpr int NUM_OUTPUTS = 3549;  // YOLOv8 output anchors at 416x416
 constexpr float CONF_THRESHOLD = 0.25f;
 constexpr float NMS_THRESHOLD = 0.45f;
 constexpr int MAX_DETECTIONS = 100;
@@ -38,17 +35,16 @@ constexpr size_t CACHE_LINE_SIZE = 64;
 // Buffer sizes
 constexpr size_t YUYV_BUFFER_SIZE = INPUT_WIDTH * INPUT_HEIGHT * 2;  // 614,400 bytes
 constexpr size_t RGB_BUFFER_SIZE = INPUT_WIDTH * INPUT_HEIGHT * 3;   // 921,600 bytes
-constexpr size_t MODEL_INPUT_SIZE = MODEL_SIZE * MODEL_SIZE * 3;     // 1,228,800 elements
-constexpr size_t MODEL_INPUT_BYTES_FP16 = MODEL_INPUT_SIZE * 2;      // 2,457,600 bytes
+// MODEL_INPUT_SIZE & MODEL_INPUT_FLOATS are now dynamically allocated based on model file
+constexpr size_t MAX_MODEL_SIZE = 640; // Hard limit for maximum input size to prevent memory explosion
+constexpr size_t MAX_MODEL_INPUT_SIZE = MAX_MODEL_SIZE * MAX_MODEL_SIZE * 3;     // 1,228,800 elements
+constexpr size_t MAX_MODEL_INPUT_BYTES_FP16 = MAX_MODEL_INPUT_SIZE * 2;      // 2,457,600 bytes
 
 // Thread configuration - OPTIMIZED for minimal cache contention
 constexpr int INPUT_THREAD_CPU = 0;
 constexpr int PREPROCESS_THREAD_CPU = 1;
 constexpr int NCNN_THREAD_START = 1;
 constexpr int NCNN_NUM_THREADS = 4;  // Use all 4 cores for maximum throughput
-
-// Model input size in floats (FP32)
-constexpr size_t MODEL_INPUT_FLOATS = MODEL_SIZE * MODEL_SIZE * 3;
 
 // ============================================================================
 // Aligned Memory Allocator

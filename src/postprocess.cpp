@@ -16,17 +16,19 @@ namespace yolo {
 int decode_yolov8_output(
     const float* output,
     int num_outputs,
+    int num_classes,
+    int model_width,
     float conf_threshold,
     Detection* detections,
     int max_detections
 ) {
     int count = 0;
     
-    // YOLOv8 output format (transposed): [8400, 84]
-    // Each row: [cx, cy, w, h, class_scores[80]]
+    // YOLOv8 output format (transposed): [num_outputs, 4 + num_classes]
+    // Each row: [cx, cy, w, h, class_scores[num_classes]]
     
     for (int i = 0; i < num_outputs && count < max_detections; i++) {
-        const float* row = output + i * (4 + NUM_CLASSES);
+        const float* row = output + i * (4 + num_classes);
         
         // Get box coordinates
         float cx = row[0];
@@ -38,7 +40,7 @@ int decode_yolov8_output(
         int best_class = 0;
         float best_score = row[4];
         
-        for (int c = 1; c < NUM_CLASSES; c++) {
+        for (int c = 1; c < num_classes; c++) {
             if (row[4 + c] > best_score) {
                 best_score = row[4 + c];
                 best_class = c;
@@ -51,10 +53,10 @@ int decode_yolov8_output(
         }
         
         // Convert to x1, y1, x2, y2 format (normalized to model size)
-        float x1 = (cx - w * 0.5f) / MODEL_SIZE;
-        float y1 = (cy - h * 0.5f) / MODEL_SIZE;
-        float x2 = (cx + w * 0.5f) / MODEL_SIZE;
-        float y2 = (cy + h * 0.5f) / MODEL_SIZE;
+        float x1 = (cx - w * 0.5f) / model_width;
+        float y1 = (cy - h * 0.5f) / model_width;
+        float x2 = (cx + w * 0.5f) / model_width;
+        float y2 = (cy + h * 0.5f) / model_width;
         
         // Clamp to [0, 1]
         x1 = std::max(0.0f, std::min(1.0f, x1));
@@ -155,13 +157,14 @@ void map_detection_to_original(
     int pad_x,
     int pad_y,
     int orig_width,
-    int orig_height
+    int orig_height,
+    int model_width
 ) {
     // Convert from normalized [0,1] to model pixel coordinates
-    float x1_model = det.x1 * MODEL_SIZE;
-    float y1_model = det.y1 * MODEL_SIZE;
-    float x2_model = det.x2 * MODEL_SIZE;
-    float y2_model = det.y2 * MODEL_SIZE;
+    float x1_model = det.x1 * model_width;
+    float y1_model = det.y1 * model_width; // Assuming square model input right now
+    float x2_model = det.x2 * model_width;
+    float y2_model = det.y2 * model_width;
     
     // Remove padding
     x1_model -= pad_x;

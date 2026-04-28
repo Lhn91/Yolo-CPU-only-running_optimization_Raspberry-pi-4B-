@@ -46,7 +46,7 @@ done
 # Clean if requested
 if [ $CLEAN -eq 1 ]; then
     echo "Cleaning build directory..."
-    rm -rf "${BUILD_DIR}"
+    sudo rm -rf "${BUILD_DIR}"
 fi
 
 # Create build directory

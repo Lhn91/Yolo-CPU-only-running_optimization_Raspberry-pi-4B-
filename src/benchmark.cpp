@@ -19,6 +19,116 @@
 #include <iostream>
 
 namespace yolo {
+namespace {
+
+BenchmarkStats calculate_stats_for_timings(
+    const std::vector<FrameTiming>& timings,
+    size_t peak_memory_kb
+) {
+    BenchmarkStats stats = {};
+
+    if (timings.empty()) {
+        return stats;
+    }
+
+    stats.total_frames = static_cast<int>(timings.size());
+
+    // Extract timing values
+    std::vector<double> total_times(timings.size());
+    double sum_capture = 0;
+    double sum_preprocess = 0;
+    double sum_inference = 0;
+    double sum_postprocess = 0;
+    double sum_detections = 0;
+
+    for (size_t i = 0; i < timings.size(); i++) {
+        total_times[i] = static_cast<double>(timings[i].total_time_us);
+        sum_capture += timings[i].capture_time_us;
+        sum_preprocess += timings[i].preprocess_time_us;
+        sum_inference += timings[i].inference_time_us;
+        sum_postprocess += timings[i].postprocess_time_us;
+        sum_detections += timings[i].detection_count;
+
+        if (timings[i].total_time_us > 50000) {
+            stats.frames_over_50ms++;
+        }
+    }
+
+    // Calculate initial mean and std for outlier detection
+    double initial_sum = std::accumulate(total_times.begin(), total_times.end(), 0.0);
+    double initial_mean = initial_sum / timings.size();
+    double initial_sq_sum = 0;
+    for (double t : total_times) {
+        initial_sq_sum += (t - initial_mean) * (t - initial_mean);
+    }
+    double initial_std = std::sqrt(initial_sq_sum / timings.size());
+
+    // Remove outliers (> 3 std from mean) for percentile calculation
+    // This handles kernel scheduling spikes that aren't representative
+    double outlier_threshold = initial_mean + 3 * initial_std;
+    std::vector<double> filtered_times;
+    filtered_times.reserve(total_times.size());
+    for (double t : total_times) {
+        if (t <= outlier_threshold) {
+            filtered_times.push_back(t);
+        }
+    }
+
+    // If too many filtered, use original
+    if (filtered_times.size() < timings.size() * 0.95) {
+        filtered_times = total_times;  // Keep original if >5% outliers
+    }
+
+    // Sort for percentile calculation
+    std::vector<double> sorted_times = filtered_times;
+    std::sort(sorted_times.begin(), sorted_times.end());
+
+    // Calculate statistics on filtered data
+    double sum = std::accumulate(filtered_times.begin(), filtered_times.end(), 0.0);
+    stats.mean_total_us = sum / filtered_times.size();
+
+    // Standard deviation
+    double sq_sum = 0;
+    for (double t : filtered_times) {
+        sq_sum += (t - stats.mean_total_us) * (t - stats.mean_total_us);
+    }
+    stats.std_total_us = std::sqrt(sq_sum / filtered_times.size());
+
+    // Min/Max
+    stats.min_total_us = sorted_times.front();
+    stats.max_total_us = sorted_times.back();
+
+    // Percentiles
+    stats.p50_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 50.0);
+    stats.p90_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 90.0);
+    stats.p95_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 95.0);
+    stats.p99_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 99.0);
+
+    // Component breakdown
+    stats.mean_capture_us = sum_capture / timings.size();
+    stats.mean_preprocess_us = sum_preprocess / timings.size();
+    stats.mean_inference_us = sum_inference / timings.size();
+    stats.mean_postprocess_us = sum_postprocess / timings.size();
+    stats.mean_detections = sum_detections / timings.size();
+
+    // FPS calculations
+    if (stats.mean_total_us > 0.0) {
+        stats.fps_mean = 1000000.0 / stats.mean_total_us;
+    }
+    if (stats.p50_total_us > 0.0) {
+        stats.fps_p50 = 1000000.0 / stats.p50_total_us;
+    }
+    if (stats.p99_total_us > 0.0) {
+        stats.fps_p99 = 1000000.0 / stats.p99_total_us;
+    }
+
+    // Memory
+    stats.peak_memory_kb = peak_memory_kb;
+
+    return stats;
+}
+
+}  // namespace
 
 // ============================================================================
 // Memory Usage
@@ -120,95 +230,17 @@ void Benchmark::update_memory_stats() {
 }
 
 BenchmarkStats Benchmark::calculate_stats() const {
-    BenchmarkStats stats = {};
-    
-    if (timings_.empty()) {
-        return stats;
+    return calculate_stats_for_timings(timings_, peak_memory_kb_);
+}
+
+BenchmarkStats Benchmark::calculate_stats_range(size_t start_index, size_t end_index) const {
+    if (start_index >= end_index || start_index >= timings_.size()) {
+        return {};
     }
-    
-    stats.total_frames = timings_.size();
-    
-    // Extract timing values
-    std::vector<double> total_times(timings_.size());
-    double sum_capture = 0, sum_preprocess = 0, sum_inference = 0, sum_postprocess = 0;
-    
-    for (size_t i = 0; i < timings_.size(); i++) {
-        total_times[i] = static_cast<double>(timings_[i].total_time_us);
-        sum_capture += timings_[i].capture_time_us;
-        sum_preprocess += timings_[i].preprocess_time_us;
-        sum_inference += timings_[i].inference_time_us;
-        sum_postprocess += timings_[i].postprocess_time_us;
-        
-        if (timings_[i].total_time_us > 50000) {
-            stats.frames_over_50ms++;
-        }
-    }
-    
-    // Calculate initial mean and std for outlier detection
-    double initial_sum = std::accumulate(total_times.begin(), total_times.end(), 0.0);
-    double initial_mean = initial_sum / timings_.size();
-    double initial_sq_sum = 0;
-    for (double t : total_times) {
-        initial_sq_sum += (t - initial_mean) * (t - initial_mean);
-    }
-    double initial_std = std::sqrt(initial_sq_sum / timings_.size());
-    
-    // Remove outliers (> 3 std from mean) for percentile calculation
-    // This handles kernel scheduling spikes that aren't representative
-    double outlier_threshold = initial_mean + 3 * initial_std;
-    std::vector<double> filtered_times;
-    filtered_times.reserve(total_times.size());
-    for (double t : total_times) {
-        if (t <= outlier_threshold) {
-            filtered_times.push_back(t);
-        }
-    }
-    
-    // If too many filtered, use original
-    if (filtered_times.size() < timings_.size() * 0.95) {
-        filtered_times = total_times;  // Keep original if >5% outliers
-    }
-    
-    // Sort for percentile calculation
-    std::vector<double> sorted_times = filtered_times;
-    std::sort(sorted_times.begin(), sorted_times.end());
-    
-    // Calculate statistics on filtered data
-    double sum = std::accumulate(filtered_times.begin(), filtered_times.end(), 0.0);
-    stats.mean_total_us = sum / filtered_times.size();
-    
-    // Standard deviation
-    double sq_sum = 0;
-    for (double t : filtered_times) {
-        sq_sum += (t - stats.mean_total_us) * (t - stats.mean_total_us);
-    }
-    stats.std_total_us = std::sqrt(sq_sum / filtered_times.size());
-    
-    // Min/Max
-    stats.min_total_us = sorted_times.front();
-    stats.max_total_us = sorted_times.back();
-    
-    // Percentiles
-    stats.p50_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 50.0);
-    stats.p90_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 90.0);
-    stats.p95_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 95.0);
-    stats.p99_total_us = calculate_percentile(sorted_times.data(), sorted_times.size(), 99.0);
-    
-    // Component breakdown
-    stats.mean_capture_us = sum_capture / timings_.size();
-    stats.mean_preprocess_us = sum_preprocess / timings_.size();
-    stats.mean_inference_us = sum_inference / timings_.size();
-    stats.mean_postprocess_us = sum_postprocess / timings_.size();
-    
-    // FPS calculations
-    stats.fps_mean = 1000000.0 / stats.mean_total_us;
-    stats.fps_p50 = 1000000.0 / stats.p50_total_us;
-    stats.fps_p99 = 1000000.0 / stats.p99_total_us;
-    
-    // Memory
-    stats.peak_memory_kb = peak_memory_kb_;
-    
-    return stats;
+
+    end_index = std::min(end_index, timings_.size());
+    std::vector<FrameTiming> window(timings_.begin() + start_index, timings_.begin() + end_index);
+    return calculate_stats_for_timings(window, peak_memory_kb_);
 }
 
 void Benchmark::export_csv(const std::string& path) const {

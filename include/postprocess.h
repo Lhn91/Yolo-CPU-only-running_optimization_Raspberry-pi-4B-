@@ -15,12 +15,12 @@ namespace yolo {
 /**
  * @brief Decode YOLOv8 raw output to detection boxes
  * 
- * YOLOv8 output format: [batch, 84, 8400]
- * - 84 = 4 (box coords) + 80 (class scores)
- * - 8400 = number of anchor points
+ * YOLOv8 output format transposed to [num_outputs, 4 + num_classes]
  * 
- * @param output Raw model output (transposed to [8400, 84])
- * @param num_outputs Number of output anchors (8400)
+ * @param output Raw model output (transposed)
+ * @param num_outputs Number of output anchors
+ * @param num_classes Number of classes
+ * @param model_width The width of the model input (e.g. 640)
  * @param conf_threshold Confidence threshold for filtering
  * @param detections Output detection array
  * @param max_detections Maximum detections to return
@@ -29,6 +29,8 @@ namespace yolo {
 int decode_yolov8_output(
     const float* output,
     int num_outputs,
+    int num_classes,
+    int model_width,
     float conf_threshold,
     Detection* detections,
     int max_detections
@@ -95,6 +97,7 @@ inline float calculate_iou(const Detection& a, const Detection& b) {
  * @param pad_y Vertical padding
  * @param orig_width Original image width
  * @param orig_height Original image height
+ * @param model_width Model input width
  */
 void map_detection_to_original(
     Detection& det,
@@ -102,7 +105,8 @@ void map_detection_to_original(
     int pad_x,
     int pad_y,
     int orig_width,
-    int orig_height
+    int orig_height,
+    int model_width
 );
 
 /**

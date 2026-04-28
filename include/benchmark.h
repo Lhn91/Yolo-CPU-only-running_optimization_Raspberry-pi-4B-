@@ -72,6 +72,7 @@ struct BenchmarkStats {
     int total_frames;
     int dropped_frames;
     int frames_over_50ms;   // Frames exceeding realtime budget
+    double mean_detections; // Mean detections per frame
     
     // System metrics
     size_t peak_memory_kb;
@@ -115,6 +116,13 @@ public:
      * @brief Calculate aggregate statistics
      */
     BenchmarkStats calculate_stats() const;
+
+    /**
+     * @brief Calculate aggregate statistics for a subset of recorded frames
+     * @param start_index Inclusive start index in timings()
+     * @param end_index Exclusive end index in timings()
+     */
+    BenchmarkStats calculate_stats_range(size_t start_index, size_t end_index) const;
 
     /**
      * @brief Export results to CSV

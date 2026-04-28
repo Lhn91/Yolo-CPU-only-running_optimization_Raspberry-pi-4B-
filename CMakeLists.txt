@@ -18,7 +18,9 @@ set(WARNING_FLAGS "-Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wformat
 
 # Release build flags
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${CORTEX_A72_FLAGS} ${WARNING_FLAGS} -O3 -ffast-math -flto -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${CORTEX_A72_FLAGS} ${WARNING_FLAGS} -O3 -ffast-math -flto -DNDEBUG -fno-rtti -fno-exceptions")
+# C++ exceptions required: httplib (Dashboard client) and try/catch in main.cpp.
+# Keep -fno-rtti for size; RTTI is not used by this target.
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${CORTEX_A72_FLAGS} ${WARNING_FLAGS} -O3 -ffast-math -flto -DNDEBUG -fno-rtti")
 
 # Debug flags
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} ${CORTEX_A72_FLAGS} -O0 -g -DDEBUG")
@@ -139,6 +141,8 @@ set(SOURCES
     src/inference_engine.cpp
     src/postprocess.cpp
     src/benchmark.cpp
+    src/dashboard_client.cpp
+    src/mjpeg_stream_server.cpp
 )
 
 # Assembly sources (compiled separately to avoid LTO issues)
@@ -163,6 +167,9 @@ set(HEADERS
     include/postprocess.h
     include/benchmark.h
     include/asm_kernels.h
+    include/touch_input.h
+    include/servo_control.h
+    include/mjpeg_stream_server.h
 )
 
 # ============================================================================

@@ -28,6 +28,10 @@
 #include <vector>
 #include <unistd.h>
 
+// #region agent log
+#warning "DEBUG_SYNC_a1fd6f_video_writer_h"
+// #endregion
+
 namespace yolo {
 
 // ============================================================================
@@ -73,6 +77,7 @@ static const cv::Scalar CLASS_COLORS[] = {
     cv::Scalar(255, 55, 199),  // Hot Pink
 };
 
+constexpr int NUM_LABEL_NAMES = sizeof(COCO_NAMES) / sizeof(COCO_NAMES[0]);
 constexpr int NUM_COLORS = sizeof(CLASS_COLORS) / sizeof(CLASS_COLORS[0]);
 
 // ============================================================================
@@ -104,8 +109,9 @@ public:
             cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
             
             char label[64];
+            const int label_class_id = (det.class_id >= 0) ? (det.class_id % NUM_LABEL_NAMES) : 0;
             snprintf(label, sizeof(label), "%s %.0f%%", 
-                     COCO_NAMES[det.class_id % NUM_CLASSES], 
+                     COCO_NAMES[label_class_id], 
                      det.confidence * 100);
             
             int baseline = 0;

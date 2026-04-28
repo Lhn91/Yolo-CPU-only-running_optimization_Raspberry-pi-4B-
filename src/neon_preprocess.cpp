@@ -23,9 +23,9 @@ namespace neon {
 // Static Pre-allocated Buffers (NO MALLOC IN HOT PATH)
 // ============================================================================
 
-static uint8_t* g_rgb_buffer = nullptr;        // 640*480*3 = 921KB
-static uint8_t* g_letterbox_buffer = nullptr;  // 640*640*3 = 1.2MB
-static uint8_t* g_resize_temp = nullptr;       // For letterbox resize
+static uint8_t* g_rgb_buffer = nullptr;        // INPUT_WIDTH*INPUT_HEIGHT*3
+static uint8_t* g_letterbox_buffer = nullptr;  // Dynamically sized, up to MAX_MODEL_SIZE
+static uint8_t* g_resize_temp = nullptr;       // Dynamically sized, up to MAX_MODEL_SIZE
 static std::atomic<bool> g_buffers_initialized{false};
 
 void init_preprocess_buffers() {
@@ -34,13 +34,13 @@ void init_preprocess_buffers() {
     }
     
     g_rgb_buffer = static_cast<uint8_t*>(aligned_alloc_64(INPUT_WIDTH * INPUT_HEIGHT * 3));
-    g_letterbox_buffer = static_cast<uint8_t*>(aligned_alloc_64(MODEL_SIZE * MODEL_SIZE * 3));
-    g_resize_temp = static_cast<uint8_t*>(aligned_alloc_64(MODEL_SIZE * MODEL_SIZE * 3));
+    g_letterbox_buffer = static_cast<uint8_t*>(aligned_alloc_64(MAX_MODEL_SIZE * MAX_MODEL_SIZE * 3));
+    g_resize_temp = static_cast<uint8_t*>(aligned_alloc_64(MAX_MODEL_SIZE * MAX_MODEL_SIZE * 3));
     
     // Touch pages to ensure they're mapped
     if (g_rgb_buffer) memset(g_rgb_buffer, 0, INPUT_WIDTH * INPUT_HEIGHT * 3);
-    if (g_letterbox_buffer) memset(g_letterbox_buffer, 114, MODEL_SIZE * MODEL_SIZE * 3);
-    if (g_resize_temp) memset(g_resize_temp, 0, MODEL_SIZE * MODEL_SIZE * 3);
+    if (g_letterbox_buffer) memset(g_letterbox_buffer, 114, MAX_MODEL_SIZE * MAX_MODEL_SIZE * 3);
+    if (g_resize_temp) memset(g_resize_temp, 0, MAX_MODEL_SIZE * MAX_MODEL_SIZE * 3);
 }
 
 void cleanup_preprocess_buffers() {
@@ -507,13 +507,15 @@ void rgb_to_chw_fp16_neon(
 void preprocess_frame_neon(
     const uint8_t* __restrict yuyv_src,
     __fp16* __restrict fp16_dst,
+    int target_width,
+    int target_height,
     float* scale,
     int* pad_x,
     int* pad_y
 ) {
     // Allocate temporary buffers
     size_t rgb_size = INPUT_WIDTH * INPUT_HEIGHT * 3;
-    size_t letterbox_size = MODEL_SIZE * MODEL_SIZE * 3;
+    size_t letterbox_size = target_width * target_height * 3;
     
     uint8_t* rgb_buf = static_cast<uint8_t*>(aligned_alloc_64(rgb_size));
     uint8_t* letterbox_buf = static_cast<uint8_t*>(aligned_alloc_64(letterbox_size));
@@ -536,15 +538,15 @@ void preprocess_frame_neon(
     letterbox_resize_neon(
         rgb_buf, letterbox_buf,
         INPUT_WIDTH, INPUT_HEIGHT,
-        MODEL_SIZE,
+        target_width, // assuming square for now, or adapt letterbox_resize_neon for w!=h
         scale, pad_x, pad_y
     );
     
     // Step 3: RGB to CHW FP16
     rgb_to_chw_fp16_neon(
         letterbox_buf, fp16_dst,
-        MODEL_SIZE, MODEL_SIZE,
-        MODEL_SIZE * 3
+        target_width, target_height,
+        target_width * 3
     );
     
     aligned_free(rgb_buf);
@@ -739,6 +741,8 @@ void preprocess_bgr_direct(
     float* __restrict fp32_dst,
     int src_width,
     int src_height,
+    int target_width,
+    int target_height,
     int src_stride,
     float* scale,
     int* pad_x,
@@ -750,22 +754,22 @@ void preprocess_bgr_direct(
     }
     
     // Calculate letterbox parameters
-    float scale_x = static_cast<float>(MODEL_SIZE) / src_width;
-    float scale_y = static_cast<float>(MODEL_SIZE) / src_height;
+    float scale_x = static_cast<float>(target_width) / src_width;
+    float scale_y = static_cast<float>(target_height) / src_height;
     *scale = std::min(scale_x, scale_y);
     
     int new_width = static_cast<int>(src_width * (*scale));
     int new_height = static_cast<int>(src_height * (*scale));
     
-    *pad_x = (MODEL_SIZE - new_width) / 2;
-    *pad_y = (MODEL_SIZE - new_height) / 2;
+    *pad_x = (target_width - new_width) / 2;
+    *pad_y = (target_height - new_height) / 2;
     
     // Fill letterbox buffer with gray (114/255 normalized)
     const uint8_t gray = 114;
-    memset(g_letterbox_buffer, gray, MODEL_SIZE * MODEL_SIZE * 3);
+    memset(g_letterbox_buffer, gray, target_width * target_height * 3);
     
     // Note: letterbox_center calculation kept for reference but not used directly
-    // uint8_t* letterbox_center = g_letterbox_buffer + (*pad_y) * MODEL_SIZE * 3 + (*pad_x) * 3;
+    // uint8_t* letterbox_center = g_letterbox_buffer + (*pad_y) * target_width * 3 + (*pad_x) * 3;
     
     // Resize with BGR->RGB conversion
     bilinear_resize_bgr_to_rgb_neon(
@@ -776,21 +780,21 @@ void preprocess_bgr_direct(
     
     // Copy resized image to letterbox center
     for (int y = 0; y < new_height; y++) {
-        memcpy(g_letterbox_buffer + (y + *pad_y) * MODEL_SIZE * 3 + (*pad_x) * 3,
+        memcpy(g_letterbox_buffer + (y + *pad_y) * target_width * 3 + (*pad_x) * 3,
                g_resize_temp + y * new_width * 3,
                new_width * 3);
     }
     
     // Convert to FP32 CHW using ASSEMBLY kernel (fastest path)
-    size_t channel_size = MODEL_SIZE * MODEL_SIZE;
+    size_t channel_size = target_width * target_height;
     rgb_to_chw_fp32_asm(
         g_letterbox_buffer,
         fp32_dst,                    // R channel
         fp32_dst + channel_size,     // G channel
         fp32_dst + channel_size * 2, // B channel
-        MODEL_SIZE,
-        MODEL_SIZE,
-        MODEL_SIZE * 3
+        target_width,
+        target_height,
+        target_width * 3
     );
 }
 
@@ -801,6 +805,8 @@ void preprocess_bgr_direct(
 void preprocess_yuyv_to_fp32(
     const uint8_t* __restrict yuyv_src,
     float* __restrict fp32_dst,
+    int target_width,
+    int target_height,
     float* scale,
     int* pad_x,
     int* pad_y
@@ -818,18 +824,18 @@ void preprocess_yuyv_to_fp32(
     );
     
     // Step 2: Letterbox resize
-    *scale = static_cast<float>(MODEL_SIZE) / INPUT_WIDTH;
-    float scale_y = static_cast<float>(MODEL_SIZE) / INPUT_HEIGHT;
+    *scale = static_cast<float>(target_width) / INPUT_WIDTH;
+    float scale_y = static_cast<float>(target_height) / INPUT_HEIGHT;
     if (scale_y < *scale) *scale = scale_y;
     
     int new_width = static_cast<int>(INPUT_WIDTH * (*scale));
     int new_height = static_cast<int>(INPUT_HEIGHT * (*scale));
     
-    *pad_x = (MODEL_SIZE - new_width) / 2;
-    *pad_y = (MODEL_SIZE - new_height) / 2;
+    *pad_x = (target_width - new_width) / 2;
+    *pad_y = (target_height - new_height) / 2;
     
     // Fill with gray
-    memset(g_letterbox_buffer, 114, MODEL_SIZE * MODEL_SIZE * 3);
+    memset(g_letterbox_buffer, 114, target_width * target_height * 3);
     
     // Resize
     bilinear_resize_rgb_neon(
@@ -841,21 +847,21 @@ void preprocess_yuyv_to_fp32(
     
     // Copy to letterbox center
     for (int y = 0; y < new_height; y++) {
-        memcpy(g_letterbox_buffer + (y + *pad_y) * MODEL_SIZE * 3 + (*pad_x) * 3,
+        memcpy(g_letterbox_buffer + (y + *pad_y) * target_width * 3 + (*pad_x) * 3,
                g_resize_temp + y * new_width * 3,
                new_width * 3);
     }
     
     // Convert to FP32 CHW using ASSEMBLY kernel
-    size_t channel_size = MODEL_SIZE * MODEL_SIZE;
+    size_t channel_size = target_width * target_height;
     rgb_to_chw_fp32_asm(
         g_letterbox_buffer,
         fp32_dst,
         fp32_dst + channel_size,
         fp32_dst + channel_size * 2,
-        MODEL_SIZE,
-        MODEL_SIZE,
-        MODEL_SIZE * 3
+        target_width,
+        target_height,
+        target_width * 3
     );
 }
 

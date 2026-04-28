@@ -17,10 +17,24 @@
 #include "benchmark.h"
 #include "video_writer.h"
 #include "drm_display.h"
+#include "touch_input.h"
+#include "servo_control.h"
+#include "dashboard_client.h"
+#include "mjpeg_stream_server.h"
+#include "json.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <iostream>
 #include <string>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <fstream>
 #include <signal.h>
 #include <getopt.h>
 #include <set>
@@ -29,7 +43,14 @@
 #include <filesystem>
 #include <iomanip>
 #include <cmath>
+#include <limits>
+#include <system_error>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
+// #region agent log
+#warning "DEBUG_SYNC_a1fd6f_main_cpp"
+// #endregion
 
 using namespace yolo;
 
@@ -56,11 +77,14 @@ struct Options {
     std::string preds_dir;              // Folder to export YOLO predictions (for mAP eval)
     int frames = 1000;                   // Frames to process
     int warmup_frames = 30;              // Warmup frames
+    int duration_sec = 0;                // Wall-clock duration after warmup
+    int snapshot_sec = 0;                // Snapshot interval for time-window metrics
     bool verbose = false;                // Verbose output
     bool test_model = false;             // Test model loading only
     bool test_inference = false;         // Test single inference only
     bool test_camera = false;            // Test camera capture only
     std::string output_csv;              // Output CSV path
+    std::string interval_output_csv;     // Interval metrics CSV path
     std::string output_image_detail_csv;   // Per-image CSV: item,time_ms,fps,detections
     std::string output_image_summary_csv;  // Summary CSV: metric,value
     std::string output_video;            // Output video path (with bbox)
@@ -72,6 +96,12 @@ struct Options {
     bool use_vulkan = false;             // Use Vulkan GPU compute
     bool use_int8 = false;               // Use INT8 quantized model
     int gpu_device = 0;                  // Vulkan GPU device index
+    bool servo_enabled = false;          // Enable servo control via PWM
+    std::string dashboard_url;           // Dashboard URL (e.g. http://127.0.0.1:5000)
+    std::string dashboard_stream_url;    // Optional MJPEG URL for /stream-config (manual override)
+    int mjpeg_port = 0;                  // 0 = off; else serve integrated MJPEG on 0.0.0.0:port (like Coral)
+    int mjpeg_quality = 72;             // JPEG quality for dashboard + MJPEG stream
+    std::string tailscale_ip;           // Optional 100.x override for stream URL registration
 };
 
 void print_usage(const char* program) {
@@ -89,6 +119,9 @@ void print_usage(const char* program) {
     std::cout << "  --frames N           Number of frames to process (default: 1000)\n";
     std::cout << "  --warmup N           Warmup frames (default: 30)\n";
     std::cout << "  --output FILE        Export results to CSV\n";
+    std::cout << "  --duration-sec N     Run measured benchmark for N seconds after warmup\n";
+    std::cout << "  --snapshot-sec N     Write interval metrics every N seconds\n";
+    std::cout << "  --interval-output FILE Export interval metrics CSV\n";
     std::cout << "  --output-detail FILE Export per-image detail CSV\n";
     std::cout << "  --output-summary FILE Export per-image summary CSV\n";
     std::cout << "  --preds-dir DIR      Export predictions (YOLO txt) for mAP eval\n";
@@ -98,6 +131,12 @@ void print_usage(const char* program) {
     std::cout << "  --display            Show detection results in window (auto DISPLAY=:0)\n";
     std::cout << "  --vulkan             Use Vulkan GPU (VideoCore VII) for inference\n";
     std::cout << "  --int8               Use INT8 quantized model (faster, similar accuracy)\n";
+    std::cout << "  --servo              Enable servo motor control (GPIO 12 PWM)\n";
+    std::cout << "  --dashboard URL      Send metrics and video to Dashboard URL (e.g. http://127.0.0.1:5000)\n";
+    std::cout << "  --mjpeg-port N       Serve MJPEG on 0.0.0.0:N/stream (same process; use with --dashboard, default off)\n";
+    std::cout << "  --mjpeg-quality N    JPEG quality 30-95 for stream/snapshot (default 72)\n";
+    std::cout << "  --tailscale-ip ADDR  Pi 100.x.x.x for registered stream URL (else: tailscale CLI or LAN IP)\n";
+    std::cout << "  --dashboard-stream-url URL  Force this /stream-config URL (skip auto if set)\n";
     std::cout << "  --gpu N              Vulkan GPU device index (default: 0)\n";
     std::cout << "  --verbose            Print per-frame results\n\n";
     std::cout << "Testing:\n";
@@ -117,6 +156,9 @@ bool parse_options(int argc, char* argv[], Options& opts) {
         {"frames", required_argument, 0, 'n'},
         {"warmup", required_argument, 0, 'w'},
         {"output", required_argument, 0, 'o'},
+        {"duration-sec", required_argument, 0, 'u'},
+        {"snapshot-sec", required_argument, 0, 'q'},
+        {"interval-output", required_argument, 0, 'l'},
         {"output-detail", required_argument, 0, 'a'},
         {"output-summary", required_argument, 0, 's'},
         {"output-video", required_argument, 0, 'O'},
@@ -133,12 +175,18 @@ bool parse_options(int argc, char* argv[], Options& opts) {
         {"test-inference", no_argument, 0, '2'},
         {"test-camera", no_argument, 0, '3'},
         {"device", required_argument, 0, 'd'},
+        {"servo", no_argument, 0, 'Z'},
+        {"dashboard", required_argument, 0, 'U'},
+        {"dashboard-stream-url", required_argument, 0, 'T'},
+        {"mjpeg-port", required_argument, 0, 'J'},
+        {"mjpeg-quality", required_argument, 0, 'K'},
+        {"tailscale-ip", required_argument, 0, 'Y'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "bc:v:x:p:m:n:w:o:a:s:O:FC:DGIg:Vd:r:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "bc:v:x:p:m:n:w:o:u:q:l:a:s:O:FC:DBGIg:Vd:r:hZUTJK:Y:", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'b':
                 opts.mode = "benchmark";
@@ -169,6 +217,15 @@ bool parse_options(int argc, char* argv[], Options& opts) {
                 break;
             case 'o':
                 opts.output_csv = optarg;
+                break;
+            case 'u':
+                opts.duration_sec = std::stoi(optarg);
+                break;
+            case 'q':
+                opts.snapshot_sec = std::stoi(optarg);
+                break;
+            case 'l':
+                opts.interval_output_csv = optarg;
                 break;
             case 'a':
                 opts.output_image_detail_csv = optarg;
@@ -209,6 +266,24 @@ bool parse_options(int argc, char* argv[], Options& opts) {
             case 'd':
                 opts.device = optarg;
                 break;
+            case 'Z':
+                opts.servo_enabled = true;
+                break;
+            case 'U':
+                opts.dashboard_url = optarg;
+                break;
+            case 'T':
+                opts.dashboard_stream_url = optarg;
+                break;
+            case 'J':
+                opts.mjpeg_port = std::stoi(optarg);
+                break;
+            case 'K':
+                opts.mjpeg_quality = std::stoi(optarg);
+                break;
+            case 'Y':
+                opts.tailscale_ip = optarg;
+                break;
             case '1':
                 opts.test_model = true;
                 break;
@@ -231,6 +306,30 @@ bool parse_options(int argc, char* argv[], Options& opts) {
     if (!opts.test_camera && (opts.param_path.empty() || opts.bin_path.empty())) {
         std::cerr << "Error: --param and --bin are required\n";
         return false;
+    }
+
+    if (opts.duration_sec < 0 || opts.snapshot_sec < 0) {
+        std::cerr << "Error: --duration-sec and --snapshot-sec must be >= 0\n";
+        return false;
+    }
+
+    if (opts.mjpeg_quality < 30) {
+        opts.mjpeg_quality = 30;
+    }
+    if (opts.mjpeg_quality > 95) {
+        opts.mjpeg_quality = 95;
+    }
+    if (opts.mjpeg_port < 0) {
+        std::cerr << "Error: --mjpeg-port must be >= 0\n";
+        return false;
+    }
+
+    if (!opts.interval_output_csv.empty() && opts.snapshot_sec == 0) {
+        opts.snapshot_sec = 900;
+    }
+
+    if (opts.snapshot_sec > 0 && opts.interval_output_csv.empty()) {
+        opts.interval_output_csv = "interval_metrics.csv";
     }
 
     // Parse class filter if specified
@@ -288,6 +387,176 @@ bool parse_options(int argc, char* argv[], Options& opts) {
         }
     }
 
+    return true;
+}
+
+static std::string make_timestamp_string() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf = {};
+
+#ifdef _WIN32
+    localtime_s(&tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &tm_buf);
+#endif
+
+    char buffer[32];
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm_buf) == 0) {
+        return "";
+    }
+    return buffer;
+}
+
+static double read_system_temperature_celsius() {
+    {
+        std::ifstream sysfs("/sys/class/thermal/thermal_zone0/temp");
+        double milli_celsius = 0.0;
+        if (sysfs >> milli_celsius) {
+            return milli_celsius / 1000.0;
+        }
+    }
+
+    FILE* pipe = popen("vcgencmd measure_temp 2>/dev/null", "r");
+    if (!pipe) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    char buffer[128] = {};
+    if (!fgets(buffer, sizeof(buffer), pipe)) {
+        pclose(pipe);
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    pclose(pipe);
+
+    double temperature_c = 0.0;
+    if (sscanf(buffer, "temp=%lf", &temperature_c) == 1) {
+        return temperature_c;
+    }
+
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+static std::string detect_tailscale_ip_v4() {
+    FILE* pipe = popen("tailscale ip -4 2>/dev/null", "r");
+    if (!pipe) {
+        return "";
+    }
+    char buf[96] = {};
+    if (!fgets(buf, sizeof(buf), pipe)) {
+        pclose(pipe);
+        return "";
+    }
+    pclose(pipe);
+    std::string s = buf;
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+        s.pop_back();
+    }
+    return s;
+}
+
+static std::string detect_local_ip_udp() {
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        return "";
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(53);
+    if (inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr) != 1) {
+        ::close(s);
+        return "";
+    }
+    if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(s);
+        return "";
+    }
+    sockaddr_in name{};
+    socklen_t len = sizeof(name);
+    if (::getsockname(s, reinterpret_cast<sockaddr*>(&name), &len) != 0) {
+        ::close(s);
+        return "";
+    }
+    char out[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &name.sin_addr, out, sizeof(out))) {
+        ::close(s);
+        return "";
+    }
+    ::close(s);
+    return std::string(out);
+}
+
+static bool ensure_parent_directory_exists(const std::string& path) {
+    namespace fs = std::filesystem;
+
+    fs::path out_path(path);
+    fs::path parent = out_path.parent_path();
+    if (parent.empty()) {
+        return true;
+    }
+
+    std::error_code ec;
+    fs::create_directories(parent, ec);
+    return !ec;
+}
+
+static bool initialize_interval_metrics_csv(const std::string& path) {
+    if (path.empty()) return false;
+
+    if (!ensure_parent_directory_exists(path)) {
+        std::cerr << "Warning: cannot create interval output directory for " << path << "\n";
+        return false;
+    }
+
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "Warning: cannot open interval csv for writing: " << path << "\n";
+        return false;
+    }
+
+    file << "timestamp,elapsed_sec,window_start_sec,window_end_sec,frames_window,detections_mean,"
+         << "latency_mean_us,latency_p50_us,latency_p95_us,latency_p99_us,"
+         << "fps_mean,fps_p99,frames_over_50ms,peak_memory_mb,temperature_c\n";
+    return true;
+}
+
+static bool append_interval_metrics_csv(
+    const std::string& path,
+    double elapsed_sec,
+    double window_start_sec,
+    double window_end_sec,
+    const BenchmarkStats& stats,
+    double temperature_c
+) {
+    if (path.empty()) return false;
+
+    std::ofstream file(path, std::ios::app);
+    if (!file.is_open()) {
+        std::cerr << "Warning: cannot append interval csv: " << path << "\n";
+        return false;
+    }
+
+    file << make_timestamp_string() << ","
+         << std::fixed << std::setprecision(3) << elapsed_sec << ","
+         << window_start_sec << ","
+         << window_end_sec << ","
+         << stats.total_frames << ","
+         << std::setprecision(4) << stats.mean_detections << ","
+         << std::setprecision(1) << stats.mean_total_us << ","
+         << stats.p50_total_us << ","
+         << stats.p95_total_us << ","
+         << stats.p99_total_us << ","
+         << std::setprecision(4) << stats.fps_mean << ","
+         << stats.fps_p99 << ","
+         << stats.frames_over_50ms << ","
+         << std::setprecision(4) << (static_cast<double>(stats.peak_memory_kb) / 1024.0) << ",";
+
+    if (!std::isnan(temperature_c)) {
+        file << std::setprecision(3) << temperature_c;
+    }
+
+    file << "\n";
     return true;
 }
 
@@ -415,7 +684,9 @@ static int run_images_inference(const Options& opts) {
     int warmup = opts.warmup_frames > 0 ? opts.warmup_frames : 1;
     engine.warmup(warmup);
 
-    AlignedPtr<float> model_input = make_aligned_buffer<float>(MODEL_INPUT_FLOATS);
+    // Dynamically allocate model input buffer based on detected model width/height
+    size_t model_input_floats = engine.get_model_width() * engine.get_model_height() * 3;
+    AlignedPtr<float> model_input = make_aligned_buffer<float>(model_input_floats);
     if (!model_input) {
         std::cerr << "Failed to allocate input buffer\n";
         neon::cleanup_preprocess_buffers();
@@ -455,6 +726,8 @@ static int run_images_inference(const Options& opts) {
             model_input.get(),
             bgr.cols,
             bgr.rows,
+            engine.get_model_width(),
+            engine.get_model_height(),
             (int)bgr.step[0],
             &scale, &pad_x, &pad_y
         );
@@ -608,8 +881,9 @@ int test_single_inference(const Options& opts) {
     engine.warmup(3);
     
     // Create test input (all zeros)
-    AlignedPtr<__fp16> input = make_aligned_buffer<__fp16>(MODEL_INPUT_SIZE);
-    memset(input.get(), 0, MODEL_INPUT_SIZE * sizeof(__fp16));
+    size_t model_input_size = engine.get_model_width() * engine.get_model_height() * 3;
+    AlignedPtr<__fp16> input = make_aligned_buffer<__fp16>(model_input_size);
+    memset(input.get(), 0, model_input_size * sizeof(__fp16));
     
     // Run inference
     DetectionResult result;
@@ -814,6 +1088,94 @@ int run_inference_pipeline(const Options& opts) {
         std::cout << "Framebuffer mode: No X11 overhead, max FPS!\n";
     }
     
+    // Initialize touch input (if framebuffer display is active)
+    std::unique_ptr<TouchInput> touch_input;
+    if (fb_display) {
+        touch_input = std::make_unique<TouchInput>();
+        
+        // Set callback: forward touch/click events to fb_display for button hit-testing
+        FramebufferDisplay* fb_ptr = fb_display.get();
+        touch_input->set_touch_callback([fb_ptr](int x, int y, bool pressed) {
+            fb_ptr->handle_input(x, y, pressed);
+        });
+        
+        if (touch_input->start(fb_display->screen_width(), fb_display->screen_height())) {
+            std::cout << "Touch input: active";
+            if (touch_input->has_mouse()) std::cout << " (mouse cursor enabled)";
+            std::cout << "\n";
+        } else {
+            std::cerr << "Warning: Touch input failed to start (check /dev/input permissions)\n";
+            std::cerr << "  Try: sudo chmod 666 /dev/input/event*\n";
+            touch_input.reset();
+        }
+    }
+    
+    // Initialize servo controller (if enabled + framebuffer active)
+    std::unique_ptr<ServoController> servo;
+    if (opts.servo_enabled && fb_display) {
+        servo = std::make_unique<ServoController>();
+        ServoController::Config servo_config;
+        // Default: GPIO 12, PWM chip 0, channel 0
+        servo_config.pwm_chip    = 0;
+        servo_config.pwm_channel = 0;
+        servo_config.speed_dps   = 90.0f;   // 90°/sec when holding button
+        
+        if (servo->start(servo_config)) {
+            // Enable servo buttons on display
+            fb_display->set_servo_enabled(true);
+            fb_display->set_servo_callback([&servo](int dir) {
+                servo->set_direction(dir);
+            });
+            std::cout << "Servo control: active (GPIO 12 PWM)\n";
+        } else {
+            std::cerr << "Warning: Servo init failed (see instructions above)\n";
+            servo.reset();
+        }
+    }
+    
+    // Integrated MJPEG (same camera frames as inference; like CoralVisionRT)
+    std::unique_ptr<MjpegStreamServer> mjpeg_srv;
+    if (opts.mjpeg_port > 0) {
+        mjpeg_srv = std::make_unique<MjpegStreamServer>(opts.mjpeg_port);
+        if (!mjpeg_srv->start()) {
+            std::cerr << "Warning: MJPEG server failed to bind (port in use?)\n";
+            mjpeg_srv.reset();
+        }
+    }
+
+    // Initialize Dashboard Client (if enabled)
+    std::unique_ptr<DashboardClient> dashboard;
+    if (!opts.dashboard_url.empty()) {
+        dashboard = std::make_unique<DashboardClient>();
+        if (dashboard->start(opts.dashboard_url)) {
+            std::cout << "Dashboard Client: active -> " << opts.dashboard_url << "\n";
+
+            std::string reg_url = opts.dashboard_stream_url;
+            if (reg_url.empty() && mjpeg_srv) {
+                std::string host = opts.tailscale_ip;
+                if (host.empty()) {
+                    host = detect_tailscale_ip_v4();
+                }
+                if (host.empty()) {
+                    host = detect_local_ip_udp();
+                }
+                if (!host.empty()) {
+                    reg_url = "http://" + host + ":" + std::to_string(opts.mjpeg_port) + "/stream";
+                }
+            }
+            if (!reg_url.empty()) {
+                if (dashboard->register_stream_url(reg_url)) {
+                    std::cout << "Dashboard: stream URL registered -> " << reg_url << "\n";
+                } else {
+                    std::cout << "Warning: POST /stream-config failed (check FastAPI on " << opts.dashboard_url << ")\n";
+                }
+            }
+        } else {
+            std::cerr << "Warning: Dashboard Client failed to start\n";
+            dashboard.reset();
+        }
+    }
+    
     // Initialize benchmark
     Benchmark benchmark;
     BenchmarkConfig bench_config;
@@ -821,9 +1183,25 @@ int run_inference_pipeline(const Options& opts) {
     bench_config.test_frames = opts.frames;
     bench_config.verbose = opts.verbose;
     benchmark.configure(bench_config);
+
+    bool interval_logging_enabled = false;
+    if (!opts.interval_output_csv.empty() && opts.snapshot_sec > 0) {
+        interval_logging_enabled = initialize_interval_metrics_csv(opts.interval_output_csv);
+        if (!interval_logging_enabled) {
+            std::cerr << "Warning: interval metrics logging disabled\n";
+        }
+    }
+
+    using SteadyClock = std::chrono::steady_clock;
+    SteadyClock::time_point measurement_start_time;
+    bool measurement_started = false;
+    double last_snapshot_elapsed_sec = 0.0;
+    double next_snapshot_elapsed_sec = static_cast<double>(opts.snapshot_sec);
+    size_t last_snapshot_timing_count = 0;
     
     // Allocate FP32 model input buffer (pre-allocated, reused)
-    AlignedPtr<float> model_input = make_aligned_buffer<float>(MODEL_INPUT_FLOATS);
+    size_t model_input_floats = engine.get_model_width() * engine.get_model_height() * 3;
+    AlignedPtr<float> model_input = make_aligned_buffer<float>(model_input_floats);
     if (!model_input) {
         std::cerr << "Failed to allocate input buffer\n";
         neon::cleanup_preprocess_buffers();
@@ -833,15 +1211,79 @@ int run_inference_pipeline(const Options& opts) {
     std::cout << "Starting frame processing...\n";
     std::cout << "Warmup: " << opts.warmup_frames << " frames\n";
     std::cout << "Test: " << opts.frames << " frames\n\n";
+    if (opts.duration_sec > 0) {
+        std::cout << "Duration: " << opts.duration_sec << " sec after warmup\n";
+    }
+    if (interval_logging_enabled) {
+        std::cout << "Interval metrics: every " << opts.snapshot_sec
+                  << " sec -> " << opts.interval_output_csv << "\n";
+    }
+    if (opts.duration_sec > 0 || interval_logging_enabled) {
+        std::cout << "\n";
+    }
     
     // Track FPS for overlay
     float rolling_fps = 0;
     float rolling_inference_ms = 0;
+
+    auto flush_interval_snapshot = [&](double elapsed_sec, bool force) {
+        if (!measurement_started || !interval_logging_enabled) {
+            return;
+        }
+
+        const size_t end_index = benchmark.timings().size();
+        if (end_index <= last_snapshot_timing_count) {
+            return;
+        }
+
+        if (!force && opts.snapshot_sec <= 0) {
+            return;
+        }
+
+        BenchmarkStats window_stats = benchmark.calculate_stats_range(last_snapshot_timing_count, end_index);
+        if (window_stats.total_frames <= 0) {
+            return;
+        }
+
+        const double temperature_c = read_system_temperature_celsius();
+        if (!append_interval_metrics_csv(
+                opts.interval_output_csv,
+                elapsed_sec,
+                last_snapshot_elapsed_sec,
+                elapsed_sec,
+                window_stats,
+                temperature_c)) {
+            interval_logging_enabled = false;
+            return;
+        }
+
+        std::cout << "\n[interval] " << std::fixed << std::setprecision(1) << elapsed_sec
+                  << "s | fps_mean=" << std::setprecision(2) << window_stats.fps_mean
+                  << " | p99_us=" << std::setprecision(1) << window_stats.p99_total_us
+                  << " | temp=";
+        if (std::isnan(temperature_c)) {
+            std::cout << "n/a";
+        } else {
+            std::cout << std::setprecision(2) << temperature_c << "C";
+        }
+        std::cout << " -> " << opts.interval_output_csv << "\n";
+
+        last_snapshot_timing_count = end_index;
+        last_snapshot_elapsed_sec = elapsed_sec;
+    };
     
     // Frame processing callback
     auto process_frame = [&](const FrameBuffer& frame) -> bool {
         FrameTiming timing;
         timing.frame_index = frame.frame_index;
+
+        if (!measurement_started && benchmark.warmup_complete()) {
+            measurement_started = true;
+            measurement_start_time = SteadyClock::now();
+            last_snapshot_elapsed_sec = 0.0;
+            next_snapshot_elapsed_sec = static_cast<double>(opts.snapshot_sec);
+            std::cout << "\nMeasurement window started after warmup\n";
+        }
         
         int64_t total_start = get_timestamp_ns();
         
@@ -862,6 +1304,8 @@ int run_inference_pipeline(const Options& opts) {
                     model_input.get(),
                     frame.width,
                     frame.height,
+                    engine.get_model_width(),
+                    engine.get_model_height(),
                     frame.stride,
                     &scale, &pad_x, &pad_y
                 );
@@ -870,6 +1314,8 @@ int run_inference_pipeline(const Options& opts) {
                 neon::preprocess_yuyv_to_fp32(
                     frame.data,
                     model_input.get(),
+                    engine.get_model_width(),
+                    engine.get_model_height(),
                     &scale, &pad_x, &pad_y
                 );
             }
@@ -920,6 +1366,56 @@ int run_inference_pipeline(const Options& opts) {
         rolling_fps = rolling_fps * 0.9f + current_fps * 0.1f;
         rolling_inference_ms = rolling_inference_ms * 0.9f + current_inference_ms * 0.1f;
         
+        // Push to Dashboard (if active) — body must match FastAPI MetricIn
+        // (see Dashboard-Detection-main/app/schemas.py: latency_ms, detect_count, etc.)
+        if (dashboard) {
+            try {
+                const double temp_c = read_system_temperature_celsius();
+                const double cpu_temp_for_api = std::isnan(temp_c) ? 0.0 : temp_c;
+                nlohmann::json metrics = {
+                    {"fps", rolling_fps},
+                    {"latency_ms", rolling_inference_ms},
+                    {"cpu_temp_c", cpu_temp_for_api},
+                    {"cpu_percent", 0.0},
+                    {"ram_percent", 0.0},
+                    {"detect_count", result.count},
+                    {"camera_status", "ok"},
+                };
+                dashboard->send_metrics(metrics.dump());
+
+                auto draw_and_send_jpeg = [&](const cv::Mat& bgr) {
+                    cv::Mat display_frame = bgr.clone();
+                    for (int i = 0; i < result.count; i++) {
+                        const auto& d = result.detections[i];
+                        cv::rectangle(display_frame,
+                            cv::Point(static_cast<int>(d.x1 * display_frame.cols),
+                                      static_cast<int>(d.y1 * display_frame.rows)),
+                            cv::Point(static_cast<int>(d.x2 * display_frame.cols),
+                                      static_cast<int>(d.y2 * display_frame.rows)),
+                            cv::Scalar(0, 255, 0), 2);
+                    }
+                    std::vector<uint8_t> jpeg_buffer;
+                    const int q = std::max(30, std::min(95, opts.mjpeg_quality));
+                    std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, q};
+                    cv::imencode(".jpg", display_frame, jpeg_buffer, encode_params);
+                    dashboard->send_snapshot(jpeg_buffer);
+                    if (mjpeg_srv) {
+                        mjpeg_srv->update_frame(jpeg_buffer);
+                    }
+                };
+
+                if (frame.format == PixelFormat::BGR) {
+                    cv::Mat bgr_frame(frame.height, frame.width, CV_8UC3, frame.data, frame.stride);
+                    draw_and_send_jpeg(bgr_frame);
+                } else if (frame.format == PixelFormat::YUYV) {
+                    cv::Mat yuyv(frame.height, frame.width, CV_8UC2, const_cast<uint8_t*>(frame.data), frame.stride);
+                    cv::Mat bgr;
+                    cv::cvtColor(yuyv, bgr, cv::COLOR_YUV2BGR_YUY2);
+                    draw_and_send_jpeg(bgr);
+                }
+            } catch (...) {}
+        }
+        
         // Push frame to async writer (non-blocking, done AFTER inference)
         if (video_writer && frame.format == PixelFormat::BGR) {
             // Create cv::Mat wrapper (no copy, just wrap existing data)
@@ -948,21 +1444,66 @@ int run_inference_pipeline(const Options& opts) {
         
         // Push frame to framebuffer display (direct, no X11 overhead)
         if (fb_display) {
+            // Get mouse cursor position (if available)
+            int cursor_x = -1, cursor_y = -1;
+            if (touch_input) {
+                touch_input->get_cursor(cursor_x, cursor_y);
+            }
+            
+            // Update servo angle display
+            if (servo) {
+                fb_display->update_servo_angle(servo->get_angle());
+            }
+            
             if (frame.format == PixelFormat::BGR) {
                 fb_display->push_bgr(frame.data, frame.width, frame.height, frame.stride,
-                                    result, rolling_fps, rolling_inference_ms);
+                                    result, rolling_fps, rolling_inference_ms,
+                                    cursor_x, cursor_y);
             } else if (frame.format == PixelFormat::YUYV) {
                 // Convert YUYV to BGR for framebuffer display
                 cv::Mat yuyv_frame(frame.height, frame.width, CV_8UC2, frame.data, frame.stride);
                 cv::Mat bgr_frame;
                 cv::cvtColor(yuyv_frame, bgr_frame, cv::COLOR_YUV2BGR_YUYV);
                 fb_display->push_bgr(bgr_frame.data, bgr_frame.cols, bgr_frame.rows, 
-                                    bgr_frame.step, result, rolling_fps, rolling_inference_ms);
+                                    bgr_frame.step, result, rolling_fps, rolling_inference_ms,
+                                    cursor_x, cursor_y);
+            }
+        }
+
+        // Dashboard web UI POSTs /servo; Pi must poll GET /servo (was never wired before).
+        // Touch buttons on fb0 still win while held.
+        if (dashboard && servo) {
+            static uint64_t servo_poll_i = 0;
+            if ((++servo_poll_i % 3u) == 0u) {
+                int cmd = dashboard->fetch_servo_command();
+                if (cmd >= -1 && cmd <= 1) {
+                    const int touch_dir = fb_display ? fb_display->servo_touch_direction() : 0;
+                    if (touch_dir == 0) {
+                        servo->set_direction(cmd);
+                    }
+                }
             }
         }
         
         // Record timing
         benchmark.record_frame(timing);
+
+        if (measurement_started) {
+            const double elapsed_sec = std::chrono::duration<double>(
+                SteadyClock::now() - measurement_start_time
+            ).count();
+
+            while (interval_logging_enabled &&
+                   opts.snapshot_sec > 0 &&
+                   elapsed_sec >= next_snapshot_elapsed_sec) {
+                flush_interval_snapshot(elapsed_sec, false);
+                next_snapshot_elapsed_sec += opts.snapshot_sec;
+            }
+
+            if (opts.duration_sec > 0 && elapsed_sec >= opts.duration_sec) {
+                g_running.store(false);
+            }
+        }
         
         // Progress indicator
         if (!opts.verbose && benchmark.current_frame() % 100 == 0) {
@@ -980,6 +1521,13 @@ int run_inference_pipeline(const Options& opts) {
     
     // Run pipeline
     err = pipeline.start(process_frame);
+
+    if (measurement_started && interval_logging_enabled) {
+        const double elapsed_sec = std::chrono::duration<double>(
+            SteadyClock::now() - measurement_start_time
+        ).count();
+        flush_interval_snapshot(elapsed_sec, true);
+    }
     
     std::cout << "\n";
     
@@ -992,9 +1540,32 @@ int run_inference_pipeline(const Options& opts) {
         std::cout << "  Frames dropped: " << video_writer->frames_dropped() << "\n";
     }
     
+    // Stop servo controller
+    if (servo) {
+        servo->stop();
+    }
+    
+    // Stop touch input
+    if (touch_input) {
+        touch_input->stop();
+    }
+    
     // Stop async display
     if (display) {
         display->stop();
+    }
+    
+    // Stop framebuffer display
+    if (fb_display) {
+        fb_display->stop();
+    }
+    
+    // Stop MJPEG before dashboard (closes HTTP clients)
+    mjpeg_srv.reset();
+
+    // Stop dashboard client
+    if (dashboard) {
+        dashboard->stop();
     }
     
     // Print results

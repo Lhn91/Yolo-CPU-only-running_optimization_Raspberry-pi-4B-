@@ -123,7 +123,9 @@ void rgb_to_chw_fp16_neon(
  * Minimizes memory bandwidth by fusing operations where possible.
  * 
  * @param yuyv_src Source YUYV frame (640x480)
- * @param fp16_dst Destination FP16 tensor (3x640x640 CHW)
+ * @param fp16_dst Destination FP16 tensor (3x[HxW] CHW)
+ * @param target_width Target tensor width
+ * @param target_height Target tensor height
  * @param scale Output: scale factor for coordinate mapping
  * @param pad_x Output: horizontal padding for coordinate mapping
  * @param pad_y Output: vertical padding for coordinate mapping
@@ -131,6 +133,8 @@ void rgb_to_chw_fp16_neon(
 void preprocess_frame_neon(
     const uint8_t* __restrict yuyv_src,
     __fp16* __restrict fp16_dst,
+    int target_width,
+    int target_height,
     float* scale,
     int* pad_x,
     int* pad_y
@@ -172,9 +176,11 @@ void cleanup_preprocess_buffers();
  * Uses pre-allocated buffers - NO malloc in hot path.
  * 
  * @param bgr_src Source BGR buffer (OpenCV format)
- * @param fp32_dst Destination FP32 tensor (3x640x640 CHW)
+ * @param fp32_dst Destination FP32 tensor (3x[HxW] CHW)
  * @param src_width Source image width
  * @param src_height Source image height
+ * @param target_width Target tensor width
+ * @param target_height Target tensor height
  * @param src_stride Source stride in bytes
  * @param scale Output: scale factor for coordinate mapping
  * @param pad_x Output: horizontal padding for coordinate mapping  
@@ -185,6 +191,8 @@ void preprocess_bgr_direct(
     float* __restrict fp32_dst,
     int src_width,
     int src_height,
+    int target_width,
+    int target_height,
     int src_stride,
     float* scale,
     int* pad_x,
@@ -198,7 +206,9 @@ void preprocess_bgr_direct(
  * Uses pre-allocated buffers - NO malloc in hot path.
  * 
  * @param yuyv_src Source YUYV frame (640x480)
- * @param fp32_dst Destination FP32 tensor (3x640x640 CHW)
+ * @param fp32_dst Destination FP32 tensor (3x[HxW] CHW)
+ * @param target_width Target tensor width
+ * @param target_height Target tensor height
  * @param scale Output: scale factor for coordinate mapping
  * @param pad_x Output: horizontal padding for coordinate mapping
  * @param pad_y Output: vertical padding for coordinate mapping
@@ -206,6 +216,8 @@ void preprocess_bgr_direct(
 void preprocess_yuyv_to_fp32(
     const uint8_t* __restrict yuyv_src,
     float* __restrict fp32_dst,
+    int target_width,
+    int target_height,
     float* scale,
     int* pad_x,
     int* pad_y
